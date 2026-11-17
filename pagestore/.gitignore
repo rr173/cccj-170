@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.tmp
+*.fired
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# Test stores are generated at runtime under temp dirs; never commit them.
+/db/
+/tmp/
