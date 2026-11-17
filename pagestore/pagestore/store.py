@@ -13,12 +13,15 @@ commit or abort.
 
 import fcntl
 import os
+import shutil
+import threading
 
+from . import backup as backup_mod
 from . import checkpoint as cp_mod
 from . import pageio, records, recovery
 from .crash import FaultInjector
-from .errors import (ConflictError, LockError, StorageClosedError,
-                     OverflowError)
+from .errors import (ConflictError, LockError,
+                     StorageClosedError, OverflowError)
 from .framing import read_framed, write_framed
 from .stats import Stats
 from .wal import WAL
@@ -77,6 +80,9 @@ def create(store_dir, num_pages, slots_per_page, initial_value=0,
 
 def open_store(store_dir, cache_budget=None, enable_faults=True):
     """Open an existing store, running crash recovery before any reads."""
+    # A previous process may have died mid-backup; its unpublished staging
+    # tree can never be promoted, so remove it before recovery scans files.
+    backup_mod.sweep_staging(store_dir)
     meta = _decode_meta(read_framed(os.path.join(store_dir, META_NAME)))
     budget = meta["cache_budget"] if cache_budget is None else cache_budget
     store = Storage(store_dir, meta, Stats(), FaultInjector(
@@ -133,6 +139,23 @@ class Storage:
         self._wal_pos = {"segment": 1, "offset": 0}
         self._ready = False
         self._closed = False
+        # Concurrency boundary: every mutation of the structures above takes
+        # this reentrant lock.  Online backups take it only for short
+        # bookkeeping sections (register/barrier/unregister); all byte
+        # copying happens without it, so commit/flush/checkpoint interleave
+        # freely with an in-progress backup.
+        self._txn_lock = threading.RLock()
+        # Notified whenever the active-backup set changes, so close() can
+        # wait without spinning.
+        self._backup_done = threading.Condition(self._txn_lock)
+        # Monotonic per-page version: bumped on every atomic page
+        # publication.  An online backup pins each page's version at its
+        # barrier and either reads the still-current file or a retained
+        # previous version, guaranteeing one coherent point in time.
+        self._page_versions = {}
+        # bid -> {"retention": dir}; only present while a backup is running.
+        self._active_backups = {}
+        self._backup_seq = 0
 
     # ------------------------------------------------------------- locking
     def _acquire_lock(self):
@@ -153,14 +176,15 @@ class Storage:
 
     # ------------------------------------------------------------- txn API
     def begin(self):
-        self._check_ready()
-        txid = self._next_txn_id
-        self._next_txn_id += 1
-        self._txns[txid] = Transaction(txid)
-        self._wal.append(records.encode(records.TXN_BEGIN, txid))
-        # The begin record only needs durability before the commit record;
-        # batching here is safe because commit fsyncs the whole prefix.
-        return txid
+        with self._txn_lock:
+            self._check_ready()
+            txid = self._next_txn_id
+            self._next_txn_id += 1
+            self._txns[txid] = Transaction(txid)
+            self._wal.append(records.encode(records.TXN_BEGIN, txid))
+            # The begin record only needs durability before the commit record;
+            # batching here is safe because commit fsyncs the whole prefix.
+            return txid
 
     def read(self, page_id, slot_id, txn=None):
         """Read a slot.
@@ -170,107 +194,134 @@ class Storage:
         committed value is visible - pending values of active writers are
         never exposed.
         """
-        self._check_ready()
-        self._validate_addr(page_id, slot_id)
-        if txn is not None:
-            t = self._txns.get(txn)
-            if t is None:
-                raise StorageClosedError(f"unknown transaction {txn}")
-            if t.state != "active":
-                raise StorageClosedError(
-                    f"transaction {txn} already {t.state}")
-            if (page_id, slot_id) in t.writes:
-                return t.writes[(page_id, slot_id)]
-        slots = self._get_page(page_id)
-        slot = slots[slot_id]
-        return slot["committed"]
+        with self._txn_lock:
+            self._check_ready()
+            self._validate_addr(page_id, slot_id)
+            if txn is not None:
+                t = self._txns.get(txn)
+                if t is None:
+                    raise StorageClosedError(f"unknown transaction {txn}")
+                if t.state != "active":
+                    raise StorageClosedError(
+                        f"transaction {txn} already {t.state}")
+                if (page_id, slot_id) in t.writes:
+                    return t.writes[(page_id, slot_id)]
+            slots = self._get_page(page_id)
+            slot = slots[slot_id]
+            return slot["committed"]
 
     def set(self, txn, page_id, slot_id, value):
-        self._write(txn, page_id, slot_id, value)
+        with self._txn_lock:
+            self._write(txn, page_id, slot_id, value)
 
     def add(self, txn, page_id, slot_id, delta):
-        current = self.read(page_id, slot_id, txn)
-        new_value = current + delta
-        if new_value < INT_MIN or new_value > INT_MAX:
-            # Rejected before any write: no half mutation, no log record.
-            raise OverflowError(
-                f"add would overflow int64 ({current} + {delta})")
-        self._write(txn, page_id, slot_id, new_value)
+        with self._txn_lock:
+            current = self.read(page_id, slot_id, txn)
+            new_value = current + delta
+            if new_value < INT_MIN or new_value > INT_MAX:
+                # Rejected before any write: no half mutation, no log record.
+                raise OverflowError(
+                    f"add would overflow int64 ({current} + {delta})")
+            self._write(txn, page_id, slot_id, new_value)
 
     def commit(self, txn):
-        self._check_ready()
-        t = self._require_active(txn)
-        # WAL decision first (durability rule), page cleaning follows lazily.
-        self._wal.append(records.encode(records.COMMIT, txn))
-        self._faults.reach("commit_before_decision_fsync")
-        self._wal.fsync()
-        self._faults.reach("commit_after_decision_fsync")
-        t.state = "committed"
-        self._decisions[txn] = "committed"
-        # Install committed state into cached pages; pages not cached keep
-        # their on-disk pending state and are resolved on next load/recovery.
-        for (pid, sid), value in t.writes.items():
-            if pid in self._cache:
-                slot = self._cache[pid][sid]
-                if slot["state"] == pageio.STATE_PENDING \
-                        and slot["pending_owner"] == txn:
-                    slot["committed"] = value
-                    slot["last_committer"] = txn
-                    slot["state"] = pageio.STATE_CLEAN
-                    slot["pending_owner"] = 0
-                    slot["pending"] = value
-            self._release_lock(pid, sid, txn)
-        self._recompute_pending_pages()
-        return txn
+        with self._txn_lock:
+            self._check_ready()
+            t = self._require_active(txn)
+            # WAL decision first (durability rule), page cleaning follows lazily.
+            self._wal.append(records.encode(records.COMMIT, txn))
+            self._faults.reach("commit_before_decision_fsync")
+            self._wal.fsync()
+            self._faults.reach("commit_after_decision_fsync")
+            t.state = "committed"
+            self._decisions[txn] = "committed"
+            # Install committed state into cached pages; pages not cached keep
+            # their on-disk pending state and are resolved on next load/recovery.
+            for (pid, sid), value in t.writes.items():
+                if pid in self._cache:
+                    slot = self._cache[pid][sid]
+                    if slot["state"] == pageio.STATE_PENDING \
+                            and slot["pending_owner"] == txn:
+                        slot["committed"] = value
+                        slot["last_committer"] = txn
+                        slot["state"] = pageio.STATE_CLEAN
+                        slot["pending_owner"] = 0
+                        slot["pending"] = value
+                self._release_lock(pid, sid, txn)
+            self._recompute_pending_pages()
+            return txn
 
     def abort(self, txn):
-        self._check_ready()
-        t = self._require_active(txn)
-        self._wal.append(records.encode(records.ABORT, txn))
-        self._faults.reach("abort_before_decision_fsync")
-        self._wal.fsync()
-        self._undo_transaction(t)
-        t.state = "aborted"
-        self._decisions[txn] = "aborted"
-        return txn
+        with self._txn_lock:
+            self._check_ready()
+            t = self._require_active(txn)
+            self._wal.append(records.encode(records.ABORT, txn))
+            self._faults.reach("abort_before_decision_fsync")
+            self._wal.fsync()
+            self._undo_transaction(t)
+            t.state = "aborted"
+            self._decisions[txn] = "aborted"
+            return txn
 
     def decision(self, txn):
         """Return the durable decision for a txid, or None if unknown."""
-        return self._decisions.get(txn)
+        with self._txn_lock:
+            return self._decisions.get(txn)
 
     # ----------------------------------------------------------- page ops
     def flush_page(self, page_id):
         """Force one page to durable storage, pending values included."""
-        self._check_ready()
-        if page_id not in self._cache:
-            self._get_page(page_id)  # materialize then publish unchanged
-        self._publish_page(page_id)
+        with self._txn_lock:
+            self._check_ready()
+            if page_id not in self._cache:
+                self._get_page(page_id)  # materialize then publish unchanged
+            self._publish_page(page_id)
 
     def checkpoint(self):
         """Publish a restartable checkpoint while transactions stay active."""
+        with self._txn_lock:
+            self._check_ready()
+            self._faults.reach("checkpoint_before_publish")
+            self._wal.fsync()
+            return self._publish_checkpoint()
+
+    def backup(self, target_path):
+        """Export an independent, fully recoverable copy of this store.
+
+        The copy represents exactly one logical cutoff point taken during
+        the call: every transaction whose commit was durable at that point
+        is visible in the copy, later commits are not, and transactions
+        still active at the point are aborted by the copy's own recovery.
+        Source writers keep running throughout - the store is never frozen
+        for the duration of the directory copy.  Returns the cutoff marker
+        dict (also persisted as ``backup.marker`` inside the target).
+        """
         self._check_ready()
-        self._faults.reach("checkpoint_before_publish")
-        self._wal.fsync()
-        return self._publish_checkpoint()
+        return backup_mod.run_online_backup(self, target_path)
 
     def close(self):
         """Clean shutdown.  Crash tests must kill the process instead."""
-        if self._closed:
-            return
-        self._check_ready()
-        # Flush every cached page so a clean close leaves no pending on-disk
-        # state; this is NOT required for correctness, only tidiness.
-        for pid in list(self._cache):
-            self._publish_page(pid)
-        self._wal.fsync()
-        self._publish_checkpoint()
-        self._wal.close()
-        if self._lock_fh is not None:
-            fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
-            self._lock_fh.close()
-            self._lock_fh = None
-        self._closed = True
-        self._ready = False
+        with self._txn_lock:
+            if self._closed:
+                return
+            self._check_ready()
+            # A close must not strand a backup mid-copy: wait for in-progress
+            # backups (they never hold this lock while copying).  Condition
+            # wait releases the RLock fully and re-acquires it atomically.
+            self._backup_done.wait_for(lambda: not self._active_backups)
+            # Flush every cached page so a clean close leaves no pending on-disk
+            # state; this is NOT required for correctness, only tidiness.
+            for pid in list(self._cache):
+                self._publish_page(pid)
+            self._wal.fsync()
+            self._publish_checkpoint()
+            self._wal.close()
+            if self._lock_fh is not None:
+                fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
+                self._lock_fh.close()
+                self._lock_fh = None
+            self._closed = True
+            self._ready = False
 
     # ------------------------------------------------------------- innards
     def _write(self, txn, page_id, slot_id, value):
@@ -401,8 +452,28 @@ class Storage:
 
     def _publish_page(self, page_id):
         slots = self._cache[page_id]
+        old_version = self._page_versions.get(page_id, 0)
+        # Retain the about-to-be-replaced immutable version for every backup
+        # that may still need it.  Retention is a regular file copy into the
+        # backup's private staging subtree, never a link; it is removed when
+        # the backup unregisters.  No retention is needed for the first
+        # publication (nothing existed to pin at any earlier barrier).
+        if old_version and self._active_backups:
+            src = os.path.join(self._pages_dir,
+                               pageio.page_filename(page_id))
+            if os.path.exists(src):
+                for bid in self._active_backups:
+                    rdir = os.path.join(
+                        self._retention_dir(bid), str(page_id))
+                    os.makedirs(rdir, exist_ok=True)
+                    dst = os.path.join(
+                        rdir, f"v-{old_version:010d}")
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+                        self.stats.backup_retention_copies += 1
         pageio.write_page(self._pages_dir, page_id,
                           self.meta["slots_per_page"], slots, self.stats)
+        self._page_versions[page_id] = old_version + 1
         has_pending = any(
             s["state"] == pageio.STATE_PENDING for s in slots)
         if not has_pending:
@@ -498,11 +569,70 @@ class Storage:
     # ------------------------------------------------------------- inspect
     def inspect_durable_page(self, page_id):
         """Read the *on-disk* page, bypassing cache (for crash evidence)."""
-        return pageio.inspect_page(self._pages_dir, page_id, self.stats)
+        with self._txn_lock:
+            return pageio.inspect_page(self._pages_dir, page_id, self.stats)
 
     def durable_page_exists(self, page_id):
-        return os.path.exists(os.path.join(
-            self._pages_dir, pageio.page_filename(page_id)))
+        with self._txn_lock:
+            return os.path.exists(os.path.join(
+                self._pages_dir, pageio.page_filename(page_id)))
+
+    # ------------------------------------------------------- online backup
+    def _retention_dir(self, bid):
+        # Kept OUTSIDE the staging tree itself: staging is renamed wholesale
+        # into the published target, and retained page versions must never
+        # travel with it.  Both live under the swept staging root.
+        return os.path.join(self.dir, backup_mod.STAGING_ROOT,
+                            "retention", bid)
+
+    def _register_backup(self):
+        """Create a backup session and start retaining replaced page files."""
+        with self._txn_lock:
+            self._check_ready()
+            self._backup_seq += 1
+            bid = f"bk-{os.getpid()}-{self._backup_seq:08d}"
+            os.makedirs(self._retention_dir(bid), exist_ok=True)
+            self._active_backups[bid] = {"retention": self._retention_dir(bid)}
+            return bid
+
+    def _unregister_backup(self, bid):
+        """Drop retention for a finished/failed backup and delete its files."""
+        with self._txn_lock:
+            self._active_backups.pop(bid, None)
+            root = os.path.join(self.dir, backup_mod.STAGING_ROOT)
+            # The published target was renamed out of this path; what remains
+            # (retention copies plus the backup's staging subtree) is private
+            # to the now-finished backup.  Remove its pieces first.
+            shutil.rmtree(os.path.join(root, "retention", bid),
+                          ignore_errors=True)
+            shutil.rmtree(os.path.join(root, bid), ignore_errors=True)
+            # Remove now-empty intermediate directories.  os.rmdir only
+            # succeeds on an empty dir, so a concurrent backup's subtree
+            # keeps these paths in place and these calls are no-ops then.
+            for d in (os.path.join(root, "retention"), root):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+            self._backup_done.notify_all()
+
+    def published_page_ids(self):
+        """Page ids with at least one durable publication (for snapshots)."""
+        with self._txn_lock:
+            # Reconcile with the directory: pages published by a previous
+            # process and untouched in this one exist on disk even though the
+            # in-memory version map starts empty.
+            ids = set(self._page_versions)
+            if os.path.isdir(self._pages_dir):
+                for name in os.listdir(self._pages_dir):
+                    if name.startswith("p-") and not name.endswith(".tmp"):
+                        try:
+                            ids.add(int(name[2:]))
+                        except ValueError:
+                            continue
+            for pid in ids:
+                self._page_versions.setdefault(pid, 1)
+            return sorted(ids)
 
 
 def _encode_meta(meta: dict) -> bytes:

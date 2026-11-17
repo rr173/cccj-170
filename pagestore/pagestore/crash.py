@@ -21,10 +21,19 @@ Stable point names (part of the public test contract):
 * ``recovery_after_record_scan``   - WAL analyzed, no pages touched
 * ``recovery_mid_cleanup``         - some transactions resolved, some not
 * ``recovery_mid_page_write``      - some affected pages rewritten
+* ``backup_after_barrier``         - cutoff checkpoint published, no file
+                                     of the copy has been read yet
+* ``backup_mid_page_copy``         - at least one page copied, more remain
+* ``backup_after_page_copy``       - all pages copied, before the WAL copy
+* ``backup_after_wal_copy``        - cutoff-prefix WAL copied, before verify
+* ``backup_before_publish``        - fully verified staging, not renamed
+* ``backup_after_publish``         - target renamed (valid backup exists),
+                                     before the backup call returns
 """
 
 import json
 import os
+import time
 
 POINTS = (
     "commit_before_decision_fsync",
@@ -35,6 +44,12 @@ POINTS = (
     "recovery_after_record_scan",
     "recovery_mid_cleanup",
     "recovery_mid_page_write",
+    "backup_after_barrier",
+    "backup_mid_page_copy",
+    "backup_after_page_copy",
+    "backup_after_wal_copy",
+    "backup_before_publish",
+    "backup_after_publish",
 )
 DEFAULT_CODE = 99
 
@@ -44,16 +59,27 @@ class FaultInjector:
         self.dir = faults_dir
         self.enabled = enabled
 
-    def arm(self, point: str, code: int = DEFAULT_CODE, repeat: bool = False):
+    def arm(self, point: str, code: int = DEFAULT_CODE, repeat: bool = False,
+            mode: str = "exit"):
         if point not in POINTS:
             raise KeyError(f"unknown fault point {point}")
+        if mode not in ("exit", "block", "event"):
+            raise ValueError(f"unknown fault mode {mode}")
         os.makedirs(self.dir, exist_ok=True)
         path = os.path.join(self.dir, point + ".fault")
         with open(path, "w") as f:
-            json.dump({"mode": "exit", "code": code, "repeat": repeat}, f)
+            json.dump({"mode": mode, "code": code, "repeat": repeat}, f)
             f.flush()
             os.fsync(f.fileno())
         _fsync_dir(self.dir)
+
+    def arm_block(self, point: str):
+        """At this point the thread waits until a release marker appears."""
+        self.arm(point, mode="block")
+
+    def arm_event(self, point: str):
+        """At this point touch a one-shot event file, then keep running."""
+        self.arm(point, mode="event")
 
     def disarm(self, point: str):
         path = os.path.join(self.dir, point + ".fault")
@@ -69,8 +95,30 @@ class FaultInjector:
         return sorted(n[:-len(".fault")] for n in os.listdir(d)
                       if n.endswith(".fault"))
 
+    def release_block(self, point: str):
+        """Allow a thread parked in ``block`` mode at ``point`` to proceed."""
+        rel = os.path.join(self.dir, point + ".release")
+        with open(rel, "w") as f:
+            f.write("go")
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(self.dir)
+
+    def block_reached(self, point: str):
+        return os.path.exists(os.path.join(self.dir, point + ".waiting"))
+
+    def event_fired(self, point: str):
+        return os.path.exists(os.path.join(self.dir, point + ".event"))
+
     def reach(self, point: str):
-        """Called by the engine at a stable point; hard-exits when armed."""
+        """Called by the engine at a stable point.
+
+        ``exit`` mode hard-kills the process (crash model).  ``block`` mode
+        parks the calling thread until an external release marker appears,
+        giving tests a deterministic interleave seam.  ``event`` mode touches
+        a marker file once and continues, letting a driver observe that the
+        engine truly reached the point without stopping it.
+        """
         if not self.enabled:
             return
         path = os.path.join(self.dir, point + ".fault")
@@ -81,14 +129,55 @@ class FaultInjector:
                 cfg = json.load(f)
             except json.JSONDecodeError:
                 cfg = {}
+        mode = cfg.get("mode", "exit")
         code = int(cfg.get("code", DEFAULT_CODE))
+
+        if mode == "block":
+            # Publish a durable "reached" signal, then park.  Block faults
+            # are consumed by the explicit release rather than self-removing.
+            waiting = os.path.join(self.dir, point + ".waiting")
+            with open(waiting, "w") as f:
+                f.write(str(os.getpid()))
+                f.flush()
+                os.fsync(f.fileno())
+            _fsync_dir(self.dir)
+            rel = os.path.join(self.dir, point + ".release")
+            for _ in range(6000):           # bounded wait (~10 min)
+                if os.path.exists(rel):
+                    break
+                time.sleep(0.1)
+            else:
+                raise TimeoutError(f"block fault {point} never released")
+            for p in (waiting, rel, path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            _fsync_dir(self.dir)
+            return
+
+        if mode == "event":
+            ev = os.path.join(self.dir, point + ".event")
+            with open(ev, "w") as f:
+                f.write(str(os.getpid()))
+                f.flush()
+                os.fsync(f.fileno())
+            _fsync_dir(self.dir)
+            if not cfg.get("repeat"):
+                try:
+                    os.replace(path, path + ".fired")
+                    _fsync_dir(self.dir)
+                except OSError:
+                    pass
+            return
+
+        # Default: hard kill, bypassing buffers/finally (crash model).
         if not cfg.get("repeat"):
             try:
                 os.replace(path, path + ".fired")
                 _fsync_dir(self.dir)
             except OSError:
                 pass
-        # Hard kill: bypass buffers/finally, emulating process crash.
         os._exit(code)
 
 

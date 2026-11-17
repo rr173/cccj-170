@@ -9,3 +9,7 @@ dist/
 # Test stores are generated at runtime under temp dirs; never commit them.
 /db/
 /tmp/
+# Bounded evidence emitted by the backup test run (regenerated each run).
+/tests/evidence/
+# Online backup staging never survives a successful run.
+/.backup-staging/

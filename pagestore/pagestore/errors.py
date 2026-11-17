@@ -33,5 +33,15 @@ class IllegalReferenceError(StorageError):
     """A durable pointer (checkpoint/WAL segment) cannot be followed."""
 
 
+class BackupError(StorageError):
+    """An online backup could not be completed and published.
+
+    The source store is never modified by a failed backup: the partially
+    built target stays in an unpublished staging directory that is removed
+    before this error is raised, so no valid-looking backup ever exists at
+    the requested target path.
+    """
+
+
 # Re-exported so callers only need ``pagestore.errors``.
 from .framing import CorruptionError, IncompleteTail  # noqa: E402,F401

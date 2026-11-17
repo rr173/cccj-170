@@ -14,17 +14,24 @@ import sys
 
 from . import create, open_store
 from .crash import FaultInjector
-from .errors import StorageError
+from .errors import BackupError, StorageError
+from . import backup as backup_mod
 
 
-def _arm(store_dir, point, code):
-    FaultInjector(os.path.join(store_dir, "faults")).arm(point, int(code))
-    print(json.dumps({"armed": point, "code": int(code)}))
+def _arm(store_dir, point, code, mode="exit"):
+    FaultInjector(os.path.join(store_dir, "faults")).arm(
+        point, int(code), mode=mode)
+    print(json.dumps({"armed": point, "code": int(code), "mode": mode}))
 
 
 def _disarm(store_dir, point):
     FaultInjector(os.path.join(store_dir, "faults")).disarm(point)
     print(json.dumps({"disarmed": point}))
+
+
+def _release(store_dir, point):
+    FaultInjector(os.path.join(store_dir, "faults")).release_block(point)
+    print(json.dumps({"released": point}))
 
 
 def _dump_stats(store, path):
@@ -55,10 +62,16 @@ def main(argv=None):
     arm.add_argument("dir")
     arm.add_argument("point")
     arm.add_argument("--code", type=int, default=99)
+    arm.add_argument("--mode", choices=("exit", "block", "event"),
+                     default="exit")
 
     dis = sub.add_parser("disarm-fault")
     dis.add_argument("dir")
     dis.add_argument("point")
+
+    rel = sub.add_parser("release-fault")
+    rel.add_argument("dir")
+    rel.add_argument("point")
 
     ph = sub.add_parser("phase")
     ph.add_argument("dir")
@@ -86,6 +99,18 @@ def main(argv=None):
     dec.add_argument("txids", type=int, nargs="+")
     dec.add_argument("--stats-out")
 
+    bk = sub.add_parser(
+        "backup",
+        help="export a live, independently openable consistent backup")
+    bk.add_argument("dir")
+    bk.add_argument("target")
+    bk.add_argument("--stats-out")
+
+    mk = sub.add_parser(
+        "backup-marker",
+        help="print the cutoff marker of a published backup")
+    mk.add_argument("target")
+
     args = p.parse_args(argv)
 
     if args.cmd == "create":
@@ -97,10 +122,13 @@ def main(argv=None):
         return 0
 
     if args.cmd == "arm-fault":
-        _arm(args.dir, args.point, args.code)
+        _arm(args.dir, args.point, args.code, args.mode)
         return 0
     if args.cmd == "disarm-fault":
         _disarm(args.dir, args.point)
+        return 0
+    if args.cmd == "release-fault":
+        _release(args.dir, args.point)
         return 0
 
     if args.cmd == "phase":
@@ -157,6 +185,33 @@ def main(argv=None):
                 _dump_stats(st, args.stats_out)
         finally:
             st.close()
+        return 0
+    if args.cmd == "backup":
+        st = open_store(args.dir)
+        try:
+            marker = st.backup(args.target)
+            if args.stats_out:
+                _dump_stats(st, args.stats_out)
+        except BackupError as exc:
+            print(json.dumps({"error": "BackupError", "detail": str(exc)}),
+                  file=sys.stderr)
+            return 3
+        finally:
+            if not st._closed:
+                st.close()
+        print(json.dumps({"backup": args.target, "cutoff": marker["cutoff"],
+                          "committed_txids": marker["committed_txids"],
+                          "next_txn_id": marker["next_txn_id"]},
+                         sort_keys=True))
+        return 0
+    if args.cmd == "backup-marker":
+        try:
+            marker = backup_mod.read_marker(args.target)
+        except OSError as exc:
+            print(json.dumps({"error": type(exc).__name__,
+                              "detail": str(exc)}), file=sys.stderr)
+            return 3
+        print(json.dumps(marker, sort_keys=True))
         return 0
     return 2
 

@@ -168,3 +168,85 @@ CRC 覆盖 `MAGIC+LEN+PAYLOAD`。读取时：
   硬杀，绝不以 close 冒充崩溃**。
 * `bin/ps.py inspect-raw` 绕过恢复直接解析原始页文件，用于证明崩溃瞬间
   磁盘上确实存在未提交 pending、或某页确实尚未发布。
+
+## 10. 在线备份（不冻结源库的一致副本）
+
+`Storage.backup(target)` 把一个正在被并发写的存储目录导出为**可独立
+`open_store`、继续读写、再次关闭重开**的副本。它从不把源库写入冻结到
+整目录复制结束；复制期间提交、页刷写、淘汰、检查点全部继续交错。
+
+### 10.1 单一逻辑时点（截止点）如何确定
+
+1. **注册与版本保留**：备份开始即在源库登记 `bid`。此后每次页发布在
+   `os.replace` 覆盖旧页文件前，把旧的不可变版本复制到该备份私有的
+   保留目录 `<src>/.backup-staging/retention/<bid>/<pid>/v-<ver>`（普通
+   文件复制，绝不是硬/软链接）。每页维护单调递增的版本号。
+2. **屏障（唯一短临界区）**：在存储事务锁内 `fsync` WAL，并按当时 WAL
+   位置 `(segment, offset)` 发布一份普通检查点。由于所有 WAL 追加与
+   提交 `fsync` 都在同一把锁内，`(segment, offset)` 必是精确帧边界，
+   且其之前的每条 COMMIT/ABORT 都已完整落盘。备份在此钉住：检查点序号、
+   截止位置、每页屏障版本号、按**持久确认顺序**排列的决定表、下一个
+   txid。
+3. **无锁复制**：之后所有字节复制都不持锁。某页当前版本仍等于屏障版本
+   就直接读在线文件（复制后再复核版本，期间若被替换则丢弃结果改读保留
+   版本）；版本已变则从保留目录取屏障版本。屏障之后才诞生的页在副本中
+   缺失，由副本自己的恢复依据检查点槽映像物化。
+4. **WAL 只复制截止前缀**：复制到截止段为止，且截止段只取前 `offset`
+   字节。截止点之后的记录物理上不进入副本，恢复不可能看到它们。
+5. **先验证后发布**：所有页帧 CRC、检查点与截止位置一致性、WAL 前缀逐
+   帧解析且恰止于截止点、逐文件 sha256/大小全部在**未发布的暂存区**内
+   校验通过后，才写 `backup.marker` 并把整目录原子 `rename` 到目标路径。
+   此前任何失败/强杀都不会在目标路径留下看似完整的备份。
+
+因此副本不是“各页各自复制时刻的拼装”：页（在线或保留的屏障版本）、
+检查点、WAL 前缀、决定表全部对应屏障上同一个 `(segment, offset)`。
+
+### 10.2 副本目录与 `backup.marker`
+
+副本是标准 PageStore 目录（`meta / pages / wal / cp`），额外在根目录带
+一份带帧 JSON `backup.marker`：
+
+```json
+{
+  "version": 1,
+  "backup_id": "bk-<pid>-<seq>",
+  "cutoff": {"segment": s, "offset": o},
+  "checkpoint_seq": N,
+  "next_txn_id": k,
+  "committed_txids": [..按持久确认顺序..],
+  "aborted_txids":   [..],
+  "page_versions": {"<page>": <屏障版本>},
+  "files": [{"path": "...", "size": n, "sha256": "...", "source": "live|retained"}]
+}
+```
+
+独立驱动可只读 marker 与公开提交确认序列对账：`committed_txids` 是该
+截止点内已持久提交事务的确认顺序；副本首次 `open_store` 先完成自身恢复
+（只暴露截止点内已提交值，截止点仍活动的事务被副本恢复中止），随后即可
+分配新事务 ID、提交、关闭重开。
+
+### 10.3 并发边界
+
+* 所有会改共享状态的公开操作（begin/read/set/add/commit/abort/
+  flush_page/checkpoint/close/inspect）都在可重入的 `_txn_lock` 内；
+  槽级冲突语义不变，同页不同槽仍可并发。
+* 备份只在登记、屏障、注销三个短段落持锁，文件复制、CRC 校验、rename
+  均不持锁，因此不会把写入暂停到复制结束。
+* 保留目录在备份注销时随暂存区一并清除；进程在备份中途死亡后，重开时
+  `sweep_staging` 删除整个 `.backup-staging`（内存中已无该备份，残树
+  永不可能再被发布），源库照常恢复可用。
+
+### 10.4 备份故障点与失败语义
+
+稳定故障点（`faults/<POINT>.fault`，支持 `exit` 硬杀、`block` 挂起等待
+释放、`event` 触达留痕三种模式）：
+`backup_after_barrier / backup_mid_page_copy / backup_after_page_copy /
+backup_after_wal_copy / backup_before_publish / backup_after_publish`。
+
+* 目标路径已存在、暂存期写入失败（含注入的 ENOSPC）、任一来源页/WAL/
+  检查点校验失败或引用缺失 → 抛 `BackupError`/`CorruptionError`/
+  `IllegalReferenceError`，删除暂存区，**源库不受影响且可继续使用**，
+  目标路径不存在有效备份，修正后可重新备份。
+* `backup_after_publish` 之后被杀：有效备份已经发布，副本可独立打开；
+  源库同样可重开。
+* 备份产物不含任何指向源目录的链接，源目录删除后副本仍独立可恢复。

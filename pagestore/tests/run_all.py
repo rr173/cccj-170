@@ -17,6 +17,8 @@ SUITES = [
      [sys.executable, "-I", os.path.join(HERE, "test_random_diff.py"), "20"]),
     ("repeated crashes during recovery",
      [sys.executable, "-I", os.path.join(HERE, "test_recovery_recrash.py")]),
+    ("online backup concurrency, cutoff and crash matrix",
+     [sys.executable, "-I", os.path.join(HERE, "test_backup.py")]),
 ]
 
 

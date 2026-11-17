@@ -22,6 +22,13 @@ class Stats:
     wal_fsyncs: int = 0
     dir_fsyncs: int = 0
     checkpoints_published: int = 0
+    # Online backup counters: bytes/pages copied into a backup staging area
+    # and the number of completed, published backups.
+    backup_page_copies: int = 0
+    backup_wal_bytes_copied: int = 0
+    backup_bytes_verified: int = 0
+    backup_retention_copies: int = 0
+    backups_published: int = 0
     # Free-form annotations (e.g. chosen checkpoint path and WAL range).
     notes: list = field(default_factory=list)
 
