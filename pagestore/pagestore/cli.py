@@ -14,8 +14,9 @@ import sys
 
 from . import create, open_store
 from .crash import FaultInjector
-from .errors import BackupError, StorageError
+from .errors import BackupError, CorruptionError, StorageError
 from . import backup as backup_mod
+from . import reclaim as reclaim_mod
 
 
 def _arm(store_dir, point, code, mode="exit"):
@@ -111,6 +112,22 @@ def main(argv=None):
         help="print the cutoff marker of a published backup")
     mk.add_argument("target")
 
+    rc = sub.add_parser(
+        "reclaim",
+        help="free engine-managed history (WAL segments / old checkpoints)")
+    rc.add_argument("dir")
+    rc.add_argument("--preview", action="store_true",
+                    help="read-only: report what could be freed and why the "
+                         "rest is pinned; publishes/writes/deletes nothing")
+    rc.add_argument("--keep-checkpoints", type=int,
+                    default=reclaim_mod.DEFAULT_CP_KEEP,
+                    help="number of newest complete checkpoints to keep in "
+                         "addition to the basis/current (default: %(default)s)")
+    rc.add_argument("--stats-out")
+    rc.add_argument("--pause-at", type=int, default=None,
+                    help="test/ops seam: stop after this many unlinks and "
+                         "wait for SIGCONT/the release file")
+
     args = p.parse_args(argv)
 
     if args.cmd == "create":
@@ -204,6 +221,38 @@ def main(argv=None):
                           "next_txn_id": marker["next_txn_id"]},
                          sort_keys=True))
         return 0
+    if args.cmd == "reclaim":
+        if args.preview and args.pause_at is None:
+            return _cli_preview(args)
+        try:
+            st = open_store(args.dir)
+        except CorruptionError as exc:
+            print(json.dumps({"error": "CorruptionError",
+                              "detail": str(exc)}), file=sys.stderr)
+            return 4
+        except StorageError as exc:
+            print(json.dumps({"error": type(exc).__name__,
+                              "detail": str(exc)}), file=sys.stderr)
+            return 2
+        try:
+            if args.preview:
+                result = st.reclaim_plan()
+                code = 0
+            else:
+                pause = None
+                if args.pause_at is not None:
+                    pause = _make_pause(os.path.join(args.dir, "faults"),
+                                        args.pause_at)
+                result = st.reclaim(keep_checkpoints=args.keep_checkpoints,
+                                    pause=pause)
+                code = 0 if result.get("ok") else 5
+            if args.stats_out:
+                _dump_stats(st, args.stats_out)
+        finally:
+            if not st._closed:
+                st.close()
+        print(json.dumps(result, sort_keys=True))
+        return code
     if args.cmd == "backup-marker":
         try:
             marker = backup_mod.read_marker(args.target)
@@ -214,6 +263,66 @@ def main(argv=None):
         print(json.dumps(marker, sort_keys=True))
         return 0
     return 2
+
+
+def _cli_preview(args):
+    """Read-only CLI preview that never opens the store for writing.
+
+    It takes no lock, publishes no checkpoint, writes no file and deletes
+    nothing - not even the crash-tail truncation a writer open performs.  The
+    plan itself is produced by the same planner the storage API uses.
+    """
+    from . import reclaim as reclaim_mod, wal as wal_mod
+    from .framing import CorruptionError, read_framed
+    from .stats import Stats
+    store_dir = args.dir
+    try:
+        meta = json.loads(read_framed(
+            os.path.join(store_dir, "meta")).decode("utf-8"))
+    except (OSError, CorruptionError, ValueError) as exc:
+        print(json.dumps({"error": type(exc).__name__, "detail": str(exc)}),
+              file=sys.stderr)
+        return 4
+    wal = wal_mod.WAL(os.path.join(store_dir, "wal"),
+                      meta["wal_segment_size"], Stats())
+    wal.open_read_only()
+    try:
+        result = reclaim_mod.preview_directory(store_dir, wal, Stats())
+    finally:
+        wal.close()
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _make_pause(faults_dir, at):
+    """Return a pause callback used by ``reclaim --pause-at``.
+
+    After ``at`` unlinks the process writes ``reclaim.paused`` and waits for
+    ``reclaim.release`` (or up to ~10 minutes).  Other threads/processes may
+    keep committing while the batch is stopped.
+    """
+    import time
+    state = {"n": 0}
+
+    def pause(i, entries):
+        state["n"] += 1
+        if state["n"] != at + 1:
+            return
+        os.makedirs(faults_dir, exist_ok=True)
+        marker = os.path.join(faults_dir, "reclaim.paused")
+        with open(marker, "w") as f:
+            f.write(f"{os.getpid()} {i} {len(entries)}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        rel = os.path.join(faults_dir, "reclaim.release")
+        for _ in range(6000):
+            if os.path.exists(rel):
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("reclaim pause never released")
+
+    return pause
 
 
 # ----------------------------------------------------------------- phases

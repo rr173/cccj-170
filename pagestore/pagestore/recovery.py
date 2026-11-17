@@ -1,9 +1,27 @@
 """Crash recovery: analysis, per-slot undo/redo, idempotent re-entry.
 
 Recovery never rebuilds the database and never replays the whole history.
-It starts from one complete checkpoint and only scans the WAL suffix the
-checkpoint points at, then resolves exactly the pages referenced by active
-transactions, dirty-page lists or post-checkpoint records.
+It starts from one complete, *usable* checkpoint and only scans the WAL
+suffix the checkpoint points at, then resolves exactly the pages referenced
+by active transactions, dirty-page lists, post-checkpoint records or durable
+pages that still carry a pending slot.
+
+A checkpoint is self-contained with respect to its own WAL position:
+
+* ``dirty_slot_images`` stores the **complete slot state** (pending owner,
+  last committer, committed, pending, undo ``prev``) of every slot on every
+  page that may have a stale durable copy - pages with committed but
+  unflushed values, pages carrying uncommitted pending values (flushed or
+  still in cache), and pages locked by an active transaction;
+* consequently a record in the reclaimed WAL prefix can never be required
+  again: not a committed write whose SET predates the checkpoint, and not
+  the undo image of a still-active transaction.  One old transaction only
+  pins the current image of its own slots, never the whole history.
+
+A checkpoint whose own WAL reference names a segment that is gone is not
+usable.  Selection never falls back "past" reclamation into an older
+checkpoint that would depend on deleted segments and silently drop data;
+when nothing usable remains it refuses to open.
 
 Idempotence across a crash *during* recovery relies on two facts:
 
@@ -19,8 +37,10 @@ import os
 
 from . import checkpoint as cp_mod
 from . import pageio, records
-from .errors import CorruptionError, IllegalReferenceError
-from .framing import read_framed
+from .errors import CorruptionError
+
+SLOT_FIELDS = ("state", "pending_owner", "last_committer", "committed",
+               "pending", "prev")
 
 
 def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
@@ -32,10 +52,10 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
     page/wal ownership in one place.
     """
     cp_dir = os.path.join(store_dir, "cp")
-    selected = cp_mod.select_latest(cp_dir, stats)
+    selected = cp_mod.select_latest(cp_dir, stats, wal=wal)
     if selected is None:
-        raise CorruptionError("no checkpoint available; database not openable",
-                              cp_dir)
+        raise CorruptionError("no usable checkpoint available; database not "
+                              "openable", cp_dir)
     cp, cp_path = selected
     stats.notes.append(f"recovery_entry={cp_path}")
     start = cp["wal_position"]
@@ -45,7 +65,6 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
     # --- Analysis: seed state from the checkpoint -----------------------
     active = {int(t): set(map(tuple, slots))
               for t, slots in cp["active"].items()}
-    # Lock map: (page, slot) -> txid, rebuilt from checkpoint lock lists.
     locks = {}
     for txid, slot_list in active.items():
         for key in slot_list:
@@ -54,10 +73,10 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
     dirty_pages = set(cp["dirty_pages"])
     last_writes = {}          # (page, slot) -> (txid, full value)
     next_txn_id = int(cp["next_txn_id"])
-    # Committed slot images carried inside the checkpoint itself, letting
-    # recovery materialize a never-flushed page without reading the WAL
-    # prefix that precedes the checkpoint position.
     cp_images = cp.get("dirty_slot_images", {})
+    if not isinstance(cp_images, dict):
+        raise CorruptionError("checkpoint dirty_slot_images is malformed",
+                              cp_path)
 
     recs, end_pos = wal.scan(start["segment"], start["offset"])
     stats.notes.append(
@@ -110,7 +129,6 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
             stats.notes.append(f"recovery_abort=tx{txid}")
         else:  # decision exists but a stale lock list lingered
             active.pop(txid, None)
-    # Locks belonging to decided transactions are released.
     for key in list(locks):
         if locks[key] in decisions:
             del locks[key]
@@ -119,7 +137,7 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
 
     # --- Resolve every page that may hold unresolved state --------------
     affected = set(dirty_pages)
-    for (pid, _sid) in list(last_writes):
+    for (pid, _sid) in last_writes:
         affected.add(pid)
     for slot_list in cp["active"].values():
         for pid, _sid in map(tuple, slot_list):
@@ -141,9 +159,9 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
 
     pages_written_this_pass = 0
     for pid in sorted(affected):
-        _resolve_page(pid, pages_dir, slot_count, initial_value, stats,
-                      decisions, last_writes, write_abort_record,
-                      cp_images.get(str(pid), {}))
+        _resolve_page(pid, cp_images.get(str(pid)), pages_dir, slot_count,
+                      initial_value, stats, decisions, last_writes,
+                      write_abort_record)
         pages_written_this_pass += 1
         # A crash here leaves later pages untouched; the next open resolves
         # them identically and the already-written ones become no-ops.
@@ -151,9 +169,21 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
             faults.reach("recovery_mid_page_write")
 
     # --- Publish a new complete checkpoint at the resolved WAL position -
-    active_after = {t: sorted(s) for t, s in active.items() if t not in decisions}
+    active_after = {t: sorted(s) for t, s in active.items()
+                    if t not in decisions}
+    reclaim = cp.get("reclaim")
+    if not isinstance(reclaim, dict):
+        reclaim = None
+    else:
+        reclaim = {"epoch": int(reclaim.get("epoch", 0)),
+                   "floor": int(reclaim.get("floor", 1))}
+    if reclaim is not None:
+        # Recovery performs no deletion, so it carries the published floor
+        # forward verbatim.  (Advancing it here would claim a prefix had been
+        # removed when it still exists; the next reclaim decides afresh.)
+        reclaim = {"epoch": reclaim["epoch"], "floor": reclaim["floor"]}
     new_cp = {
-        "version": 1,
+        "version": 2,
         "seq": int(cp["seq"]) + 1,
         "wal_position": end_pos,
         "next_txn_id": next_txn_id,
@@ -161,9 +191,9 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
                    for t, slots in active_after.items()},
         "decisions": {str(t): d for t, d in sorted(decisions.items())},
         "dirty_pages": sorted(active_page_set(active_after)),
-        # Recovery has resolved every dirty page to a clean durable copy,
-        # so no slot images remain outstanding.
+        # Every affected page was resolved to a clean durable copy.
         "dirty_slot_images": {},
+        "reclaim": reclaim,
     }
     publish_checkpoint(new_cp)
     stats.notes.append(f"recovery_complete pages_resolved={len(affected)}")
@@ -172,6 +202,7 @@ def run_recovery(store_dir, wal, pages_dir, slot_count, initial_value,
         "decisions": decisions,
         "wal_position": end_pos,
         "pages_resolved": len(affected),
+        "reclaim": reclaim,
     }
 
 
@@ -183,24 +214,90 @@ def active_page_set(active):
     return out
 
 
-def _resolve_page(pid, pages_dir, slot_count, initial_value, stats,
-                  decisions, last_writes, write_abort_record, cp_image):
+def _clean_slot(initial: int):
+    return {
+        "state": pageio.STATE_CLEAN,
+        "pending_owner": 0,
+        "last_committer": 0,
+        "committed": initial,
+        "pending": initial,
+        "prev": initial,
+    }
+
+
+def _valid_full_image(img, slot_count, path):
+    if not isinstance(img, dict):
+        return False
+    keys = set(img)
+    if keys != set(SLOT_FIELDS):
+        raise CorruptionError("checkpoint slot image has wrong fields", path)
+    if img["state"] not in (pageio.STATE_CLEAN, pageio.STATE_PENDING):
+        raise CorruptionError("checkpoint slot image illegal state", path)
+    if img["state"] == pageio.STATE_CLEAN and img["pending_owner"] != 0:
+        raise CorruptionError("checkpoint slot image clean with owner", path)
+    return True
+
+
+def _base_slots(pid, image, pages_dir, slot_count, initial_value, stats):
+    """Return ``(slots, overrode_disk)`` for one page.
+
+    A version-2 full slot image is authoritative for the page at the
+    checkpoint position; the WAL suffix is replayed on top afterwards.  A
+    legacy integer image only carries ``committed`` and is overlaid on the
+    durable page (or used to materialise a missing one).  Without an image
+    the durable page is authoritative.
+    """
+    disk = None
     path = os.path.join(pages_dir, pageio.page_filename(pid))
-    page_existed = os.path.exists(path)
-    if page_existed:
-        _n, slots = pageio.read_page(pages_dir, pid, stats)
-    else:
-        # A page referenced by the checkpoint may never have been
-        # published; seed it from initial values then the checkpoint's own
-        # committed slot images, without touching the pre-checkpoint WAL.
-        slots = [_clean_slot(initial_value) for _ in range(slot_count)]
-        for sid_str, value in cp_image.items():
+    if os.path.exists(path):
+        _n, disk = pageio.read_page(pages_dir, pid, stats)
+
+    if image is None:
+        if disk is not None:
+            return [dict(s) for s in disk], False
+        return [_clean_slot(initial_value) for _ in range(slot_count)], True
+
+    if isinstance(image, dict) and any(
+            isinstance(v, dict) for v in image.values()):
+        slots = []
+        for sid in range(slot_count):
+            img = image.get(str(sid))
+            if img is None:
+                base = disk[sid] if disk is not None else _clean_slot(
+                    initial_value)
+                slots.append(dict(base))
+                continue
+            _valid_full_image(img, slot_count, path)
+            slots.append({k: int(img[k]) for k in SLOT_FIELDS})
+        return slots, True
+
+    # Legacy image: sid -> committed int.
+    slots = ([dict(s) for s in disk] if disk is not None
+             else [_clean_slot(initial_value) for _ in range(slot_count)])
+    for sid_str, value in image.items():
+        try:
             sid = int(sid_str)
-            if 0 <= sid < slot_count:
-                slots[sid]["committed"] = int(value)
-                slots[sid]["pending"] = int(value)
-                slots[sid]["prev"] = int(value)
-    changed = not page_existed
+            val = int(value)
+        except (TypeError, ValueError):
+            raise CorruptionError("checkpoint slot image is malformed", path)
+        if not (0 <= sid < slot_count):
+            raise CorruptionError("checkpoint slot image sid out of range",
+                                  path)
+        s = slots[sid]
+        if s["state"] == pageio.STATE_CLEAN:
+            s["committed"] = val
+            s["pending"] = val
+            s["prev"] = val
+            s["last_committer"] = 0
+        else:
+            s["committed"] = val
+    return slots, True
+
+
+def _resolve_page(pid, image, pages_dir, slot_count, initial_value, stats,
+                  decisions, last_writes, write_abort_record):
+    slots, changed = _base_slots(pid, image, pages_dir, slot_count,
+                                 initial_value, stats)
     for sid, s in enumerate(slots):
         key = (pid, sid)
         owner = s["pending_owner"]
@@ -234,30 +331,9 @@ def _resolve_page(pid, pages_dir, slot_count, initial_value, stats,
         if key in last_writes:
             txid, value = last_writes[key]
             if decisions.get(txid) == "committed":
-                if s["last_committer"] < txid and not (
-                        s["state"] == pageio.STATE_PENDING
-                        and s["pending_owner"] == txid):
+                if s["last_committer"] < txid:
                     s["committed"] = value
                     s["last_committer"] = txid
                     changed = True
-                elif (s["state"] == pageio.STATE_PENDING
-                      and s["pending_owner"] == txid):
-                    # Handled above; mark nothing extra.
-                    pass
-        elif not page_existed and str(sid) in cp_image:
-            # Already seeded from the checkpoint image; ensure the slot is
-            # marked as a real installed value.
-            s["last_committer"] = max(s["last_committer"], 0)
-    if changed or not page_existed:
+    if changed:
         pageio.write_page(pages_dir, pid, slot_count, slots, stats)
-
-
-def _clean_slot(initial: int):
-    return {
-        "state": pageio.STATE_CLEAN,
-        "pending_owner": 0,
-        "last_committer": 0,
-        "committed": initial,
-        "pending": initial,
-        "prev": initial,
-    }

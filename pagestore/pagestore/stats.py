@@ -26,9 +26,19 @@ class Stats:
     # and the number of completed, published backups.
     backup_page_copies: int = 0
     backup_wal_bytes_copied: int = 0
+    backup_wal_segments_copied: int = 0
     backup_bytes_verified: int = 0
     backup_retention_copies: int = 0
     backups_published: int = 0
+    # Online history reclamation counters.  ``wal_segments_removed*`` count
+    # physical unlinks of engine-owned segments that fell below the retention
+    # floor; ``checkpoints_removed`` counts superseded checkpoint files.
+    wal_segments_removed: int = 0
+    wal_segments_removed_bytes: int = 0
+    checkpoints_removed: int = 0
+    checkpoints_removed_bytes: int = 0
+    reclaim_runs: int = 0
+    reclaim_unlinks: int = 0
     # Free-form annotations (e.g. chosen checkpoint path and WAL range).
     notes: list = field(default_factory=list)
 

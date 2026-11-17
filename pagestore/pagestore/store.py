@@ -18,7 +18,7 @@ import threading
 
 from . import backup as backup_mod
 from . import checkpoint as cp_mod
-from . import pageio, records, recovery
+from . import pageio, records, reclaim as reclaim_mod, recovery
 from .crash import FaultInjector
 from .errors import (ConflictError, LockError,
                      StorageClosedError, OverflowError)
@@ -80,20 +80,25 @@ def create(store_dir, num_pages, slots_per_page, initial_value=0,
 
 def open_store(store_dir, cache_budget=None, enable_faults=True):
     """Open an existing store, running crash recovery before any reads."""
-    # A previous process may have died mid-backup; its unpublished staging
-    # tree can never be promoted, so remove it before recovery scans files.
-    backup_mod.sweep_staging(store_dir)
     meta = _decode_meta(read_framed(os.path.join(store_dir, META_NAME)))
     budget = meta["cache_budget"] if cache_budget is None else cache_budget
     store = Storage(store_dir, meta, Stats(), FaultInjector(
         os.path.join(store_dir, "faults"), enabled=enable_faults))
+    # The writer lock must be taken BEFORE sweeping: a staging tree may
+    # belong to a backup running in the process that currently holds the
+    # lock.  Only after we own the directory can any staging residue be
+    # proven dead (a previous process died mid-backup and its unpublished
+    # staging can never be promoted).
     store._acquire_lock()
+    backup_mod.sweep_staging(store_dir)
     store._wal = WAL(os.path.join(store_dir, "wal"),
                      meta["wal_segment_size"], store.stats)
     # WAL must be openable for appending (recovery may write REC_ABORT).
     store._wal.open_for_append()
     from . import checkpoint as _cp
-    selected = _cp.select_latest(os.path.join(store_dir, "cp"), store.stats)
+    reclaim_mod.on_open(store_dir, store.stats, store.stats.notes)
+    selected = _cp.select_latest(os.path.join(store_dir, "cp"), store.stats,
+                                 wal=store._wal)
     if selected is None:
         from .framing import CorruptionError
         raise CorruptionError("no checkpoint available",
@@ -109,6 +114,11 @@ def open_store(store_dir, cache_budget=None, enable_faults=True):
     store._next_txn_id = result["next_txn_id"]
     store._decisions = result["decisions"]
     store._wal_pos = result["wal_position"]
+    rec = result.get("reclaim")
+    if isinstance(rec, dict):
+        store._reclaim = {"epoch": int(rec.get("epoch", 0)),
+                          "floor": int(rec.get("floor", 1))}
+    store._wal.set_retention_floor(store._reclaim["floor"])
     store._ready = True
     return store
 
@@ -153,9 +163,16 @@ class Storage:
         # barrier and either reads the still-current file or a retained
         # previous version, guaranteeing one coherent point in time.
         self._page_versions = {}
-        # bid -> {"retention": dir}; only present while a backup is running.
+        # bid -> {"retention": dir, "cutoff": pos, "phase": str,
+        #          "needs_pages": set}; only present while a backup runs.
         self._active_backups = {}
         self._backup_seq = 0
+        # Published retention epoch/floor (see pagestore.reclaim).  Recovered
+        # from the selected checkpoint on open.
+        self._reclaim = {"epoch": 0, "floor": 1}
+        # Test seam: callables appended here are invoked before each unlink
+        # in the (unlocked) delete phase of reclaim.run_reclaim.
+        self._reclaim_test_hooks = []
 
     # ------------------------------------------------------------- locking
     def _acquire_lock(self):
@@ -507,9 +524,13 @@ class Storage:
                     active[t.txid] = sorted(t.writes.keys())
             self._cp_seq += 1
             pos = self._wal.position()
+            # `_slot_images` persists the complete slot state (committed and
+            # undo values) of every page carrying unresolved or unflushed
+            # state, so the checkpoint fully describes recovery's starting
+            # world.  That is what lets reclaim delete every older record.
             dirty = sorted(self._dirty_page_set())
             payload = {
-                "version": 1,
+                "version": 2,
                 "seq": self._cp_seq,
                 "wal_position": pos,
                 "next_txn_id": self._next_txn_id,
@@ -518,7 +539,8 @@ class Storage:
                 "decisions": {str(t): d for t, d in
                               sorted(self._decisions.items())},
                 "dirty_pages": dirty,
-                "dirty_slot_images": self._dirty_slot_images(dirty),
+                "dirty_slot_images": self._slot_images(dirty),
+                "reclaim": dict(self._reclaim),
             }
         self._wal_pos = pos
         return cp_mod.publish(os.path.join(self.dir, "cp"),
@@ -542,22 +564,29 @@ class Storage:
                 pages.add(pid)
         return pages
 
-    def _dirty_slot_images(self, dirty_pages):
-        """Full committed post-images for slots on dirty pages.
+    def _slot_images(self, dirty_pages):
+        """Complete self-contained slot state for every checkpointed page.
 
-        The checkpoint must be self-sufficient: recovery scans only the WAL
-        suffix after the checkpoint, so a committed value whose WRITE record
-        is older than the checkpoint would otherwise be unreachable for a
-        missing/never-flushed page.  We persist the current committed image
-        of every slot of every dirty page (bounded set, read from cache or
-        the durable file) alongside the checkpoint.
+        Each entry holds state/owner/last_committer/committed/pending/prev.
+        That makes the checkpoint sufficient on its own for recovery *and*
+        for reclaim: no committed-but-unflushed write and no active
+        transaction's undo value ever needs a WAL record below the
+        checkpoint's own position.  Bounded by the dirty-page set, not by
+        history length.
         """
         images = {}
         for pid in sorted(dirty_pages):
             slots = self._get_page(pid)  # reconciles decided pending slots
             per_page = {}
             for sid, s in enumerate(slots):
-                per_page[str(sid)] = s["committed"]
+                per_page[str(sid)] = {
+                    "state": int(s["state"]),
+                    "pending_owner": int(s["pending_owner"]),
+                    "last_committer": int(s["last_committer"]),
+                    "committed": int(s["committed"]),
+                    "pending": int(s["pending"]),
+                    "prev": int(s["prev"]),
+                }
             images[str(pid)] = per_page
         return images
 
@@ -592,8 +621,38 @@ class Storage:
             self._backup_seq += 1
             bid = f"bk-{os.getpid()}-{self._backup_seq:08d}"
             os.makedirs(self._retention_dir(bid), exist_ok=True)
-            self._active_backups[bid] = {"retention": self._retention_dir(bid)}
+            # ``needs_pages`` lists the pages whose barrier version the
+            # backup may still have to read from the source; it shrinks to
+            # empty once every page file is copied.  ``cutoff`` and
+            # ``cp_file`` are filled at the barrier.  Reclaim holds the
+            # cutoff segment and the barrier checkpoint file, and the page
+            # version-retention hook guarantees pinned versions are never
+            # lost (reclaim itself never touches ``pages/``).
+            self._active_backups[bid] = {
+                "retention": self._retention_dir(bid),
+                "cutoff": None,
+                "phase": "registered",
+                "needs_pages": set(),
+            }
             return bid
+
+    def _backup_barrier_record(self, bid, cutoff, page_versions, phase,
+                               cp_file=None):
+        """Attach the barrier cutoff and pinned page set to a session.
+
+        Reclaim reads exactly this record: the cutoff segment and the pinned
+        checkpoint file are protected until the backup unregisters (whether it
+        succeeds or fails), and nothing below the cutoff is.
+        """
+        with self._txn_lock:
+            info = self._active_backups.get(bid)
+            if info is None:
+                return
+            info["cutoff"] = dict(cutoff)
+            info["page_versions"] = dict(page_versions)
+            info["needs_pages"] = set(page_versions)
+            info["cp_file"] = cp_file
+            info["phase"] = phase
 
     def _unregister_backup(self, bid):
         """Drop retention for a finished/failed backup and delete its files."""
@@ -615,6 +674,30 @@ class Storage:
                 except OSError:
                     pass
             self._backup_done.notify_all()
+
+    # ------------------------------------------------------------- reclaim
+    def reclaim_plan(self):
+        """Read-only preview of reclaimable history (no writes, no deletes).
+
+        Safe to call while transactions and online backups are running: it
+        takes only a short snapshot under the transaction lock and reports
+        both removable files and the exact requirement that pins every file
+        it says must stay.
+        """
+        return reclaim_mod.plan_reclaim(self)
+
+    def reclaim(self, keep_checkpoints=reclaim_mod.DEFAULT_CP_KEEP, pause=None):
+        """Physically free engine-managed history that is no longer needed.
+
+        Dependencies are re-decided from scratch at execution time.  See
+        :mod:`pagestore.reclaim` for the ordering guarantees: replacement
+        recovery basis durable first, then a durable manifest, then unlocked
+        real unlinks.  Returns the lists of actually removed WAL segments and
+        checkpoints with byte counts, plus keep reasons, the recoverable
+        entry and the WAL range that must stay.
+        """
+        return reclaim_mod.run_reclaim(self, keep_cp=keep_checkpoints,
+                                       pause=pause)
 
     def published_page_ids(self):
         """Page ids with at least one durable publication (for snapshots)."""

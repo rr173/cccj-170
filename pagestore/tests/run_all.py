@@ -19,6 +19,8 @@ SUITES = [
      [sys.executable, "-I", os.path.join(HERE, "test_recovery_recrash.py")]),
     ("online backup concurrency, cutoff and crash matrix",
      [sys.executable, "-I", os.path.join(HERE, "test_backup.py")]),
+    ("online history reclamation (WAL + checkpoints)",
+     [sys.executable, "-I", os.path.join(HERE, "test_reclaim.py")]),
 ]
 
 

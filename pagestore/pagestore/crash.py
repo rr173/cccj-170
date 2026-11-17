@@ -29,6 +29,14 @@ Stable point names (part of the public test contract):
 * ``backup_before_publish``        - fully verified staging, not renamed
 * ``backup_after_publish``         - target renamed (valid backup exists),
                                      before the backup call returns
+* ``reclaim_before_basis``        - reclaim started, replacement recovery
+                                     basis not published yet
+* ``reclaim_basis_published``     - replacement checkpoint + manifest are
+                                     durable, no unlink has happened yet
+* ``reclaim_before_unlink``       - about to delete the first file
+* ``reclaim_mid_unlink``          - at least one file unlinked, more remain
+* ``reclaim_after_unlinks``       - every planned unlink completed,
+                                     manifest not yet marked complete
 """
 
 import json
@@ -50,6 +58,11 @@ POINTS = (
     "backup_after_wal_copy",
     "backup_before_publish",
     "backup_after_publish",
+    "reclaim_before_basis",
+    "reclaim_basis_published",
+    "reclaim_before_unlink",
+    "reclaim_mid_unlink",
+    "reclaim_after_unlinks",
 )
 DEFAULT_CODE = 99
 

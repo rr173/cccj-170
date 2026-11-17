@@ -204,12 +204,15 @@ def _barrier(store, staging):
         cp_path = store._publish_checkpoint()
         pos = dict(store._wal_pos)
         pinned_versions = dict(store._page_versions)
-        committed = [t for t, d in store._decisions.items()
-                     if d == "committed"]
-        aborted = [t for t, d in store._decisions.items()
-                   if d == "aborted"]
+        committed = sorted(t for t, d in store._decisions.items()
+                           if d == "committed")
+        aborted = sorted(t for t, d in store._decisions.items()
+                         if d == "aborted")
         next_txn_id = store._next_txn_id
         cp_seq = store._cp_seq
+        store._backup_barrier_record(
+            os.path.basename(staging), pos, pinned_versions, "barrier",
+            cp_file=os.path.basename(cp_path))
     os.makedirs(os.path.join(staging, "pages"))
     os.makedirs(os.path.join(staging, "wal"))
     os.makedirs(os.path.join(staging, "cp"))
@@ -281,6 +284,11 @@ def _copy_all(store, staging, pinned):
             store._faults.reach("backup_mid_page_copy")
     _fsync_dir(os.path.join(staging, "pages"))
     store._faults.reach("backup_after_page_copy")
+    with store._txn_lock:
+        info = store._active_backups.get(pinned["bid"])
+        if info is not None:
+            info["needs_pages"] = set()
+            info["phase"] = "pages_copied"
 
     # ---- checkpoint: the immutable pinned file + republished current ---
     cp_name = os.path.basename(pinned["cp_path"])
@@ -298,39 +306,36 @@ def _copy_all(store, staging, pinned):
                       os.path.join(staging, "cp", cp_mod.CURRENT))})
     _fsync_dir(os.path.join(staging, "cp"))
 
-    # ---- WAL: every segment up to the cutoff, prefix length exactly off -
+    # ---- WAL: only the barrier's own cutoff segment, cut at ``off`` -----
+    #
+    # The copy never needs older segments.  Its recovery basis is the
+    # barrier checkpoint, which is self-contained (complete slot images plus
+    # the durable decision map); everything before the cutoff segment was
+    # legitimately reclaimable before the backup even started.  Copying a
+    # reclaimed-history prefix would both re-create deleted history and
+    # contradict a store whose prefix is already gone.
     cutoff_seg = pinned["cutoff"]["segment"]
     cutoff_off = pinned["cutoff"]["offset"]
     wal_src_dir = os.path.join(store.dir, "wal")
-    on_disk = sorted(seg_index(n) for n in os.listdir(wal_src_dir)
-                     if seg_index(n) > 0)
-    wanted = [s for s in on_disk if s <= cutoff_seg]
-    if not wanted or wanted[0] != 1 or wanted[-1] != cutoff_seg:
+    src = os.path.join(wal_src_dir, seg_name(cutoff_seg))
+    if not os.path.exists(src):
         raise IllegalReferenceError(
-            "cutoff WAL segment not present in source",
-            os.path.join(wal_src_dir, seg_name(cutoff_seg)))
-    for prev, cur in zip(wanted, wanted[1:]):
-        if cur != prev + 1:
-            raise IllegalReferenceError(
-                "WAL segment sequence has a hole during backup",
-                os.path.join(wal_src_dir, seg_name(prev + 1)))
-    wal_copied = 0
-    for si in wanted:
-        src = os.path.join(wal_src_dir, seg_name(si))
-        dst = os.path.join(staging, "wal", seg_name(si))
-        if si == cutoff_seg:
-            src_size = os.path.getsize(src)
-            if src_size < cutoff_off:
-                raise IllegalReferenceError(
-                    "cutoff offset beyond current segment size", src)
-            size = _copy_bytes(src, dst, max_bytes=cutoff_off)
-        else:
-            size = _copy_bytes(src, dst)
-        wal_copied += size
-        files.append({"path": os.path.join("wal", seg_name(si)),
-                      "size": size, "sha256": _sha256_file(dst)})
-    store.stats.backup_wal_bytes_copied += wal_copied
+            "cutoff WAL segment not present in source", src)
+    src_size = os.path.getsize(src)
+    if src_size < cutoff_off:
+        raise IllegalReferenceError(
+            "cutoff offset beyond current segment size", src)
+    dst = os.path.join(staging, "wal", seg_name(cutoff_seg))
+    size = _copy_bytes(src, dst, max_bytes=cutoff_off)
+    store.stats.backup_wal_bytes_copied += size
+    store.stats.backup_wal_segments_copied += 1
+    files.append({"path": os.path.join("wal", seg_name(cutoff_seg)),
+                  "size": size, "sha256": _sha256_file(dst)})
     _fsync_dir(os.path.join(staging, "wal"))
+    with store._txn_lock:
+        info = store._active_backups.get(pinned["bid"])
+        if info is not None:
+            info["phase"] = "wal_copied"
     store._faults.reach("backup_after_wal_copy")
     return files
 
@@ -373,8 +378,17 @@ def _verify_and_mark(store, staging, pinned, files):
     if cp_bytes != cur_bytes:
         raise CorruptionError("staged current does not match pinned cp")
 
-    # 4. WAL prefix: frames must parse and end exactly at the cutoff, with
-    #    no record beyond it.  This is an independent byte-level pass.
+    # 4. WAL: the copied cutoff segment must parse and end exactly at the
+    #    cutoff, with no record beyond it.  Only that segment travels now;
+    #    the checkpoint carries the authoritative decision set for the
+    #    (possibly reclaimed) prefix before it.
+    staged_segs = sorted(seg_index(n) for n in
+                         os.listdir(os.path.join(staging, "wal"))
+                         if seg_index(n) > 0)
+    if staged_segs != [int(pinned["cutoff"]["segment"])]:
+        raise CorruptionError(
+            f"staged WAL segments {staged_segs} are not exactly the cutoff "
+            f"segment {pinned['cutoff']['segment']}")
     end_seg, end_off, decoded_records = _scan_staged_wal(
         os.path.join(staging, "wal"), pinned["cutoff"])
     if (end_seg, end_off) != (pinned["cutoff"]["segment"],
@@ -383,28 +397,33 @@ def _verify_and_mark(store, staging, pinned, files):
             f"staged WAL ends at seg{end_seg}:{end_off}, cutoff is "
             f"{pinned['cutoff']}")
 
-    # 5. The durable decision SET inside the cutoff prefix must agree with
-    #    the barrier snapshot.  Order here is compared as sets: the WAL scan
-    #    yields records in log order, while the barrier snapshot preserves
-    #    the store's durable-confirmation (insertion) order; with interleaved
-    #    concurrent transactions these two orderings can legitimately differ
-    #    even though they describe the same single cutoff point.  The marker
-    #    itself keeps the confirmation order the independent driver expects.
-    seen_commits, seen_aborts, max_txid = [], [], 0
+    # 5. Decisions: the copied cutoff-suffix records may add decisions, but
+    #    they must never contradict the barrier's durable decision map, and
+    #    every decision they add must be newer than the checkpoint's own
+    #    state.  (The barrier checkpoint already carries every decision
+    #    confirmed before it, reclaimed or not.)
+    cp_decisions = {int(t): d for t, d in cp["decisions"].items()}
+    max_txid = 0
     for rec in decoded_records:
         max_txid = max(max_txid, rec["txid"])
-        if rec["type"] == records.COMMIT:
-            seen_commits.append(rec["txid"])
-        elif rec["type"] in (records.ABORT, records.REC_ABORT):
-            seen_aborts.append(rec["txid"])
-    if sorted(seen_commits) != sorted(pinned["committed_txids"]):
-        raise CorruptionError(
-            f"commit set in cutoff prefix {sorted(seen_commits)} differs "
-            f"from barrier snapshot {sorted(pinned['committed_txids'])}")
-    if sorted(seen_aborts) != sorted(pinned["aborted_txids"]):
-        raise CorruptionError("abort set mismatch between WAL and barrier")
+        if rec["type"] in (records.COMMIT, records.ABORT, records.REC_ABORT):
+            got = ("committed" if rec["type"] == records.COMMIT
+                   else "aborted")
+            prior = cp_decisions.get(rec["txid"])
+            if prior is not None and prior != got:
+                raise CorruptionError(
+                    f"staged WAL decision for tx{rec['txid']} contradicts "
+                    f"the barrier checkpoint ({prior} vs {got})")
     if max_txid + 1 > pinned["next_txn_id"]:
         raise CorruptionError("staged WAL references txid beyond next_txn_id")
+    for t in pinned["committed_txids"]:
+        if cp_decisions.get(int(t)) != "committed":
+            raise CorruptionError(
+                f"barrier commit tx{t} missing from the cutoff checkpoint")
+    for t in pinned["aborted_txids"]:
+        if cp_decisions.get(int(t)) != "aborted":
+            raise CorruptionError(
+                f"barrier abort tx{t} missing from the cutoff checkpoint")
 
     # 6. File hashes/sizes in the manifest all match.
     for entry in files:
@@ -416,9 +435,11 @@ def _verify_and_mark(store, staging, pinned, files):
         store.stats.backup_bytes_verified += entry["size"]
 
     marker = {
-        "version": 1,
+        "version": 2,
         "backup_id": pinned["bid"],
         "cutoff": pinned["cutoff"],
+        "wal_segments": sorted(
+            e["path"] for e in files if e["path"].startswith("wal/")),
         "checkpoint_seq": pinned["cp_seq"],
         "next_txn_id": pinned["next_txn_id"],
         "committed_txids": list(pinned["committed_txids"]),
